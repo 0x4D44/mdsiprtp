@@ -442,6 +442,44 @@ impl InviteDialog {
             .expect("build_update: dialog state already validated by caller")
     }
 
+    /// Build an in-dialog re-INVITE (RFC 3261 §14). Used for call hold/resume
+    /// where the SDP direction changes (e.g. `a=sendonly` for hold,
+    /// `a=sendrecv` for resume).
+    ///
+    /// CSeq is incremented normally. The SDP body is attached as
+    /// `application/sdp`. The caller is responsible for creating the
+    /// [`InviteClientTransaction`] and driving it to completion.
+    ///
+    /// Returns `None` if the dialog is not in `Confirmed` state.
+    pub fn build_reinvite(&mut self, sdp_body: &str) -> Option<SipRequest> {
+        if self.info.state != DialogState::Confirmed {
+            return None;
+        }
+        let cseq = self.info.next_local_seq();
+        let branch = format!("z9hG4bK{}", uuid::Uuid::new_v4().simple());
+        let request_uri = self.info.remote_target.clone();
+        let routes = self.info.route_set.routes();
+
+        let mut builder = SipRequest::builder()
+            .method(Method::Invite)
+            .uri(&request_uri)
+            .via("0.0.0.0", 5060, "UDP", &branch)
+            .from(&self.info.local_uri, &self.info.id.local_tag)
+            .to(&self.info.remote_uri)
+            .to_tag(&self.info.id.remote_tag)
+            .call_id(&self.info.id.call_id)
+            .cseq(cseq)
+            .max_forwards(70)
+            .route(routes)
+            .body(sdp_body.as_bytes().to_vec(), "application/sdp");
+
+        if !self.info.local_contact.is_empty() {
+            builder = builder.contact(&self.info.local_contact);
+        }
+
+        builder.build().ok()
+    }
+
     /// Build a 200 OK response to an inbound in-dialog UPDATE
     /// (RFC 3311 / RFC 4028).
     ///
