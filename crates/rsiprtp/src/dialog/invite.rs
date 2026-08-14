@@ -202,12 +202,15 @@ impl InviteDialog {
                 if (100..200).contains(&code) {
                     // Provisional response
                     if code != 100 {
-                        // Create early dialog if we have a To tag
-                        if let Some(new_info) = DialogInfo::from_invite_response_uac(
+                        // Create early dialog if we have a To tag.
+                        // Preserve local_seq: it may have been advanced by
+                        // a PRACK between provisionals.
+                        if let Some(mut new_info) = DialogInfo::from_invite_response_uac(
                             &self.invite,
                             &response,
                             DialogState::Early,
                         ) {
+                            new_info.local_seq = self.info.local_seq;
                             self.info = new_info;
                         }
 
@@ -220,12 +223,15 @@ impl InviteDialog {
                             .push(Action::Event(Event::Provisional(response)));
                     }
                 } else if (200..300).contains(&code) {
-                    // Success - dialog established
-                    if let Some(new_info) = DialogInfo::from_invite_response_uac(
+                    // Success - dialog established. Preserve local_seq: it
+                    // may have been advanced by a PRACK during the Early state.
+                    let preserved_seq = self.info.local_seq;
+                    if let Some(mut new_info) = DialogInfo::from_invite_response_uac(
                         &self.invite,
                         &response,
                         DialogState::Confirmed,
                     ) {
+                        new_info.local_seq = preserved_seq;
                         self.info = new_info;
                     } else {
                         self.info.state = DialogState::Confirmed;
