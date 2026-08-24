@@ -3,6 +3,58 @@
 //! Provides connection-oriented TCP transport for SIP messages.
 //! TCP is used when SIP messages exceed MTU size or when reliable
 //! transport is required.
+//!
+//! # Read/write lock separation (2026-07-09 fix)
+//!
+//! `TcpTransport`/`TcpSender`'s connection-management path no longer
+//! shares one lock between reading and writing on a connection.
+//! Previously, `read_loop` held a single `Mutex<TcpConnection>` for the
+//! *entire* duration of a blocking `read_message()` call (which itself
+//! loops internally awaiting more socket data). Once that loop was
+//! idling between messages, the lock stayed held, so a concurrent
+//! `TcpSender::send()`/`TcpTransport::send()` on the same connection
+//! blocked forever waiting for a lock that would only be released by
+//! more data arriving — data that, in a request/response/re-request
+//! pattern (send, receive, send again on the same connection), doesn't
+//! arrive until *after* that blocked send completes. Confirmed by
+//! direct testing (a second message queued on an otherwise-idle
+//! connection hung indefinitely) before being tracked down here.
+//!
+//! The fix: `TcpStream::into_split()` gives independent
+//! `OwnedReadHalf`/`OwnedWriteHalf` handles. The read loop owns its
+//! `OwnedReadHalf` and read buffer exclusively (no `Arc`/`Mutex` — only
+//! that one task ever touches them), so a blocked read never holds any
+//! lock. Writers (production `send()`/`send_to()`, and the read loop's
+//! own CRLF keep-alive pong/ping replies) go through a per-connection
+//! `Mutex<OwnedWriteHalf>` that's only ever held for the duration of a
+//! `write_all` call — never across a blocking read.
+//!
+//! [`TcpConnection`] (bundling one un-split `TcpStream`) is kept as-is
+//! below for the handful of tests that exercise low-level message
+//! framing directly (`read_message`/`write_message` on a single
+//! stream) — that framing logic is orthogonal to the concurrency fix
+//! above and didn't need to change; the shared `find_header_end`/
+//! `parse_content_length`/`try_parse_message_from_buf` helpers are used
+//! by both `TcpConnection` and the new split-based read path so the
+//! framing behavior stays identical either way.
+//!
+//! This also incidentally fixes a second, unrelated gap: there was no
+//! way to read back the real local address of an outbound client
+//! connection (`TcpTransport::local_addr()` returns the transport's
+//! nominal bind address, which for `new_client()` is just whatever the
+//! caller passed and is typically `:0`). [`TcpTransport::connection_local_addr`]
+//! now exposes the actual OS-assigned local address of a specific
+//! connection, captured once at `connect()`/accept time.
+//!
+//! A third addition (2026-07-09, same session): `connect()` can now
+//! bind the outbound connection to a *specific* local port, not just
+//! read one back after the fact. Pass a `new_client(SocketAddr)` with
+//! a nonzero port and `connect()` uses `TcpSocket::bind`+`connect`
+//! instead of plain `TcpStream::connect` — needed for protocols (TS
+//! 33.203 IPsec's negotiated `port-c`, in particular) where the peer
+//! is told in advance which local port to expect traffic from/to, so
+//! an OS-assigned ephemeral port won't do. A `:0` port keeps the
+//! original OS-assigned behavior.
 
 use crate::core::Result;
 use bytes::{Bytes, BytesMut};
@@ -11,7 +63,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, trace, warn};
 
@@ -161,7 +214,32 @@ fn normalize_thread_id(id: u64) -> u64 {
     }
 }
 
-/// TCP connection state.
+/// Try to parse a complete SIP message out of a framing buffer
+/// (double-CRLF header end + `Content-Length` body). Shared by both
+/// [`TcpConnection`] and the split-read-half production path so the
+/// framing behavior is identical either way.
+fn try_parse_message_from_buf(buf: &mut BytesMut) -> Option<Bytes> {
+    let data = &buf[..];
+    let header_end = find_header_end(data)?;
+
+    let headers = &data[..header_end];
+    let content_length = parse_content_length(headers);
+
+    let total_length = header_end + content_length;
+    if data.len() < total_length {
+        // Haven't received complete body yet.
+        return None;
+    }
+
+    Some(buf.split_to(total_length).freeze())
+}
+
+/// TCP connection state bundling one un-split stream. Used directly by
+/// the low-level framing tests below; the production `TcpTransport`/
+/// `TcpSender` connection-management path uses split read/write halves
+/// instead (see this module's doc comment) and doesn't construct this
+/// type.
+#[cfg(test)]
 struct TcpConnection {
     /// The TCP stream.
     stream: TcpStream,
@@ -175,6 +253,7 @@ struct TcpConnection {
     last_ping_sent: Option<Instant>,
 }
 
+#[cfg(test)]
 impl TcpConnection {
     fn new(stream: TcpStream, remote_addr: SocketAddr) -> Self {
         Self {
@@ -260,24 +339,7 @@ impl TcpConnection {
 
     /// Try to parse a complete SIP message from the buffer.
     fn try_parse_message(&mut self) -> Option<Bytes> {
-        // Look for end of headers (double CRLF)
-        let data = &self.read_buf[..];
-        let header_end = find_header_end(data)?;
-
-        // Parse Content-Length from headers
-        let headers = &data[..header_end];
-        let content_length = parse_content_length(headers);
-
-        let total_length = header_end + content_length;
-
-        if data.len() < total_length {
-            // Haven't received complete body yet
-            return None;
-        }
-
-        // Extract complete message
-        let msg = self.read_buf.split_to(total_length).freeze();
-        Some(msg)
+        try_parse_message_from_buf(&mut self.read_buf)
     }
 
     /// Write a message to the connection.
@@ -287,6 +349,7 @@ impl TcpConnection {
     }
 }
 
+#[cfg(test)]
 async fn stream_read(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
     #[cfg(test)]
     if let Some(err) = take_forced_error(&FORCE_READ_ERROR, "forced read error") {
@@ -295,12 +358,36 @@ async fn stream_read(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<
     stream.read(buf).await
 }
 
+#[cfg(test)]
 async fn stream_write_all(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
     #[cfg(test)]
     if let Some(err) = take_forced_error(&FORCE_WRITE_ERROR, "forced write error") {
         return Err(err);
     }
     stream.write_all(data).await
+}
+
+/// `OwnedReadHalf` counterpart of [`stream_read`] — used by the
+/// production split-read-half path. Shares the same forced-error test
+/// hook so tests forcing a read error don't need to care which path
+/// they're exercising.
+async fn stream_read_half(half: &mut OwnedReadHalf, buf: &mut [u8]) -> std::io::Result<usize> {
+    #[cfg(test)]
+    if let Some(err) = take_forced_error(&FORCE_READ_ERROR, "forced read error") {
+        return Err(err);
+    }
+    half.read(buf).await
+}
+
+/// `OwnedWriteHalf` counterpart of [`stream_write_all`] — used by the
+/// production split-read-half path (both for the writer's own sends
+/// and the read loop's CRLF keep-alive pong/ping replies).
+async fn stream_write_all_half(half: &mut OwnedWriteHalf, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(err) = take_forced_error(&FORCE_WRITE_ERROR, "forced write error") {
+        return Err(err);
+    }
+    half.write_all(data).await
 }
 
 async fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
@@ -348,6 +435,117 @@ fn parse_content_length(headers: &[u8]) -> usize {
     0
 }
 
+/// Per-connection state reachable for writing — shared between the
+/// production writer path (`TcpTransport::send`/`TcpSender::send`) and
+/// the read loop's own CRLF keep-alive pong/ping replies. Deliberately
+/// does *not* hold the read half or read buffer: those are owned
+/// exclusively by the read-loop task (see this module's doc comment).
+struct ConnectionHandle {
+    write_half: Mutex<OwnedWriteHalf>,
+    /// The real local address of this specific connection, captured
+    /// once at connect/accept time. See [`TcpTransport::connection_local_addr`].
+    local_addr: SocketAddr,
+}
+
+/// State owned exclusively by one read-loop task: the read half and
+/// its framing buffer. Never behind an `Arc`/`Mutex` — nothing else
+/// ever touches it, which is precisely what lets a blocked read avoid
+/// holding any lock.
+struct ReadHalfState {
+    read_half: OwnedReadHalf,
+    remote_addr: SocketAddr,
+    read_buf: BytesMut,
+    last_ping_sent: Option<Instant>,
+}
+
+impl ReadHalfState {
+    fn new(read_half: OwnedReadHalf, remote_addr: SocketAddr) -> Self {
+        Self {
+            read_half,
+            remote_addr,
+            read_buf: BytesMut::with_capacity(INITIAL_BUF_SIZE),
+            last_ping_sent: None,
+        }
+    }
+
+    fn try_parse_message(&mut self) -> Option<Bytes> {
+        try_parse_message_from_buf(&mut self.read_buf)
+    }
+
+    /// Same framing/keep-alive behavior as [`TcpConnection::read_message`],
+    /// but reading from an exclusively-owned `OwnedReadHalf` instead of
+    /// a shared `TcpStream`. `conn` is used only for the brief pong/ping
+    /// writes — never held while awaiting new data on `self.read_half`,
+    /// which needs no lock at all. This is what fixes the deadlock: a
+    /// concurrent write via `conn.write_half` can always acquire the
+    /// lock immediately, since this read path only ever takes it for a
+    /// `write_all` call that returns right away.
+    async fn read_message(
+        &mut self,
+        keepalive: &KeepAliveConfig,
+        conn: &ConnectionHandle,
+    ) -> Result<Option<Bytes>> {
+        loop {
+            let pings = strip_leading_keepalives(&mut self.read_buf);
+            for _ in 0..pings {
+                let mut w = conn.write_half.lock().await;
+                stream_write_all_half(&mut w, KEEPALIVE_PONG).await?;
+                drop(w);
+                trace!("Sent CRLF pong to {}", self.remote_addr);
+            }
+
+            if let Some(msg) = self.try_parse_message() {
+                return Ok(Some(msg));
+            }
+
+            let mut temp_buf = [0u8; 4096];
+            let read_result = if keepalive.send_pings {
+                let last = self.last_ping_sent.unwrap_or_else(Instant::now);
+                let elapsed = last.elapsed();
+                let remaining = keepalive
+                    .ping_interval
+                    .checked_sub(elapsed)
+                    .unwrap_or_default();
+                tokio::time::timeout(
+                    remaining,
+                    stream_read_half(&mut self.read_half, &mut temp_buf),
+                )
+                .await
+                .ok()
+            } else {
+                Some(stream_read_half(&mut self.read_half, &mut temp_buf).await)
+            };
+
+            let n = match read_result {
+                Some(Ok(n)) => n,
+                Some(Err(e)) => return Err(e.into()),
+                None => {
+                    let mut w = conn.write_half.lock().await;
+                    stream_write_all_half(&mut w, KEEPALIVE_PING).await?;
+                    drop(w);
+                    self.last_ping_sent = Some(Instant::now());
+                    trace!("Sent CRLF ping to {}", self.remote_addr);
+                    continue;
+                }
+            };
+
+            if n == 0 {
+                return Ok(None);
+            }
+
+            self.read_buf.extend_from_slice(&temp_buf[..n]);
+
+            if self.read_buf.len() > MAX_TCP_SIZE {
+                return Err(crate::core::TransportError::MessageTooLarge {
+                    size: self.read_buf.len(),
+                    max: MAX_TCP_SIZE,
+                }
+                .into());
+            }
+        }
+    }
+}
+
 /// TCP transport for SIP messages.
 pub struct TcpTransport {
     /// Local address.
@@ -355,13 +553,30 @@ pub struct TcpTransport {
     /// The TCP listener (for server mode).
     listener: Option<TcpListener>,
     /// Active connections (keyed by remote address).
-    connections: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<TcpConnection>>>>>,
+    connections: Arc<RwLock<HashMap<SocketAddr, Arc<ConnectionHandle>>>>,
+    /// Read halves stashed by [`connect`](Self::connect) until
+    /// [`start`](Self::start) claims them and spawns their read loops.
+    /// Only needed for the "connect, then start" client pattern —
+    /// accepted (server-side) connections spawn their read loop
+    /// immediately inside the accept loop instead.
+    pending_reads: Arc<Mutex<HashMap<SocketAddr, OwnedReadHalf>>>,
     /// Channel sender for incoming messages.
     incoming_tx: Option<mpsc::Sender<IncomingMessage>>,
     /// CRLF keep-alive configuration (RFC 5626 §3.5.1). Disabled by
     /// default to preserve existing behaviour; opt in via
     /// [`with_keepalive`](Self::with_keepalive).
     keepalive: KeepAliveConfig,
+    /// Set only by [`new_client`](Self::new_client) when given a
+    /// nonzero port — an explicit request that outbound connections
+    /// bind to that specific local port. Deliberately *not* derived
+    /// from `local_addr` directly: a [`bind`](Self::bind)-created
+    /// transport also has a nonzero `local_addr` (its listener's real
+    /// port), but that's an incidental fact about being a server, not
+    /// a request to source outbound connections from that same port
+    /// (which would just collide with the listener). Kept `None` for
+    /// `bind()` and for `new_client(:0)`, in which case `connect()`
+    /// falls back to the original OS-assigned-port behavior.
+    explicit_connect_bind: Option<SocketAddr>,
 }
 
 impl TcpTransport {
@@ -377,19 +592,34 @@ impl TcpTransport {
             local_addr,
             listener: Some(listener),
             connections: Arc::new(RwLock::new(HashMap::new())),
+            pending_reads: Arc::new(Mutex::new(HashMap::new())),
             incoming_tx: None,
             keepalive: KeepAliveConfig::default(),
+            explicit_connect_bind: None,
         })
     }
 
-    /// Create a client-only TCP transport (no listener).
+    /// Create a client-only TCP transport (no listener). If
+    /// `local_addr` has a nonzero port, [`connect`](Self::connect)
+    /// binds outbound connections to that specific port instead of
+    /// letting the OS assign one — see
+    /// [`explicit_connect_bind`](TcpTransport::explicit_connect_bind)'s
+    /// doc comment for why this is `new_client`-only, not derived from
+    /// `local_addr` generically.
     pub fn new_client(local_addr: SocketAddr) -> Self {
+        let explicit_connect_bind = if local_addr.port() != 0 {
+            Some(local_addr)
+        } else {
+            None
+        };
         Self {
             local_addr,
             listener: None,
             connections: Arc::new(RwLock::new(HashMap::new())),
+            pending_reads: Arc::new(Mutex::new(HashMap::new())),
             incoming_tx: None,
             keepalive: KeepAliveConfig::default(),
+            explicit_connect_bind,
         }
     }
 
@@ -405,11 +635,36 @@ impl TcpTransport {
     }
 
     /// Get the local address.
+    ///
+    /// For a transport created via [`bind`](Self::bind) this is the
+    /// real bound address. For [`new_client`](Self::new_client) it's
+    /// just whatever the caller passed in — typically `:0` — since a
+    /// client-only transport has no listener to bind. Use
+    /// [`connection_local_addr`](Self::connection_local_addr) for the
+    /// real local address of a specific outbound connection instead.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
+    /// Get the real local address of an established connection to
+    /// `remote`, if one exists — captured once at connect/accept time
+    /// from the underlying socket, unlike [`local_addr`](Self::local_addr)
+    /// which is only accurate for [`bind`](Self::bind)-created
+    /// transports.
+    pub async fn connection_local_addr(&self, remote: SocketAddr) -> Option<SocketAddr> {
+        let connections = self.connections.read().await;
+        connections.get(&remote).map(|h| h.local_addr)
+    }
+
     /// Connect to a remote address.
+    ///
+    /// If this transport was created via [`new_client`](Self::new_client)
+    /// with a nonzero local port, the outbound connection is explicitly
+    /// bound to it via `TcpSocket::bind`+`connect` — needed for schemes
+    /// (like TS 33.203 IPsec's negotiated `port-c`) where the local
+    /// port must be a specific, known value rather than an OS-assigned
+    /// ephemeral one. Otherwise falls back to `TcpStream::connect`'s
+    /// normal OS-assigned-port behavior.
     pub async fn connect(&self, addr: SocketAddr) -> Result<()> {
         // Check if already connected
         {
@@ -420,15 +675,42 @@ impl TcpTransport {
         }
 
         debug!("Connecting to {}", addr);
-        let stream = TcpStream::connect(addr).await?;
-        let conn = TcpConnection::new(stream, addr);
+        let stream = if let Some(bind_addr) = self.explicit_connect_bind {
+            let socket = if addr.is_ipv4() {
+                TcpSocket::new_v4()?
+            } else {
+                TcpSocket::new_v6()?
+            };
+            // SO_REUSEADDR allows rebinding the same local port
+            // immediately after the previous connection is closed,
+            // avoiding EADDRINUSE from TIME_WAIT state. Needed for
+            // protocols (IMS TS 33.203) where the UE must reuse its
+            // negotiated port-c for every protected REGISTER.
+            socket.set_reuseaddr(true)?;
+            socket.bind(bind_addr)?;
+            socket.connect(addr).await?
+        } else {
+            TcpStream::connect(addr).await?
+        };
+        let local_addr = stream.local_addr()?;
+        let (read_half, write_half) = stream.into_split();
 
         let mut connections = self.connections.write().await;
         #[cfg(test)]
         if take_skip_connect_insert_for(addr) {
             return Ok(());
         }
-        connections.insert(addr, Arc::new(Mutex::new(conn)));
+        connections.insert(
+            addr,
+            Arc::new(ConnectionHandle {
+                write_half: Mutex::new(write_half),
+                local_addr,
+            }),
+        );
+        drop(connections);
+
+        let mut pending = self.pending_reads.lock().await;
+        pending.insert(addr, read_half);
 
         Ok(())
     }
@@ -443,15 +725,15 @@ impl TcpTransport {
         self.connect(dest).await?;
 
         // Get connection and send
-        let conn_arc = {
+        let conn = {
             let connections = self.connections.read().await;
             connections.get(&dest).cloned()
         }
         .ok_or(crate::core::TransportError::ConnectionClosed)?;
 
-        let mut conn = conn_arc.lock().await;
+        let mut w = conn.write_half.lock().await;
         trace!("Sending {} bytes to {} over TCP", msg.data.len(), dest);
-        conn.write_message(&msg.data).await?;
+        stream_write_all_half(&mut w, &msg.data).await?;
 
         Ok(())
     }
@@ -472,6 +754,7 @@ impl TcpTransport {
         let connections = self.connections.clone();
         let listener = self.listener.take();
         let keepalive = self.keepalive.clone();
+        let pending_reads = self.pending_reads.clone();
 
         // Spawn accept loop if we have a listener
         if let Some(listener) = listener {
@@ -496,21 +779,35 @@ impl TcpTransport {
                         Ok((stream, remote_addr)) => {
                             debug!("Accepted connection from {}", remote_addr);
 
-                            let conn = TcpConnection::new(stream, remote_addr);
-                            let conn_arc = Arc::new(Mutex::new(conn));
+                            let local_addr = match stream.local_addr() {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    error!(
+                                        "failed to read local_addr for accepted connection from {}: {}",
+                                        remote_addr, e
+                                    );
+                                    continue;
+                                }
+                            };
+                            let (read_half, write_half) = stream.into_split();
+                            let handle = Arc::new(ConnectionHandle {
+                                write_half: Mutex::new(write_half),
+                                local_addr,
+                            });
 
                             // Store connection
                             {
                                 let mut conns = connections_clone.write().await;
-                                conns.insert(remote_addr, conn_arc.clone());
+                                conns.insert(remote_addr, handle.clone());
                             }
 
                             // Spawn read loop for this connection
+                            let read_state = ReadHalfState::new(read_half, remote_addr);
                             let tx = tx_clone.clone();
                             let conns = connections_clone.clone();
                             let ka = keepalive_clone.clone();
                             tokio::spawn(async move {
-                                Self::read_loop(conn_arc, remote_addr, tx, conns, ka).await;
+                                Self::read_loop(read_state, handle, tx, conns, ka).await;
                             });
                         }
                         Err(e) => {
@@ -527,20 +824,33 @@ impl TcpTransport {
             });
         }
 
-        // Start read loops for existing connections
+        // Start read loops for existing (pre-`connect()`ed) connections.
         let tx_clone = tx;
         let connections_clone = connections.clone();
         let keepalive_existing = keepalive;
         tokio::spawn(async move {
-            let conns = connections_clone.read().await;
-            for (addr, conn_arc) in conns.iter() {
+            let addrs: Vec<SocketAddr> = {
+                let pending = pending_reads.lock().await;
+                pending.keys().copied().collect()
+            };
+            for addr in addrs {
+                let read_half = {
+                    let mut pending = pending_reads.lock().await;
+                    pending.remove(&addr)
+                };
+                let Some(read_half) = read_half else { continue };
+                let handle = {
+                    let conns = connections_clone.read().await;
+                    conns.get(&addr).cloned()
+                };
+                let Some(handle) = handle else { continue };
+
+                let read_state = ReadHalfState::new(read_half, addr);
                 let tx = tx_clone.clone();
-                let addr = *addr;
-                let conn_arc = conn_arc.clone();
                 let conns = connections_clone.clone();
                 let ka = keepalive_existing.clone();
                 tokio::spawn(async move {
-                    Self::read_loop(conn_arc, addr, tx, conns, ka).await;
+                    Self::read_loop(read_state, handle, tx, conns, ka).await;
                 });
             }
         });
@@ -554,17 +864,15 @@ impl TcpTransport {
 
     /// Read loop for a single connection.
     async fn read_loop(
-        conn_arc: Arc<Mutex<TcpConnection>>,
-        remote_addr: SocketAddr,
+        mut read_state: ReadHalfState,
+        handle: Arc<ConnectionHandle>,
         tx: mpsc::Sender<IncomingMessage>,
-        connections: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<TcpConnection>>>>>,
+        connections: Arc<RwLock<HashMap<SocketAddr, Arc<ConnectionHandle>>>>,
         keepalive: KeepAliveConfig,
     ) {
+        let remote_addr = read_state.remote_addr;
         loop {
-            let result = {
-                let mut conn = conn_arc.lock().await;
-                conn.read_message(&keepalive).await
-            };
+            let result = read_state.read_message(&keepalive, &handle).await;
 
             match result {
                 Ok(Some(data)) => {
@@ -612,7 +920,7 @@ impl TcpTransport {
 /// Cloneable sender for TCP transport.
 #[derive(Clone)]
 pub struct TcpSender {
-    connections: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<TcpConnection>>>>>,
+    connections: Arc<RwLock<HashMap<SocketAddr, Arc<ConnectionHandle>>>>,
 }
 
 impl TcpSender {
@@ -620,15 +928,15 @@ impl TcpSender {
     pub async fn send(&self, msg: OutgoingMessage) -> Result<()> {
         let dest = msg.destination;
 
-        let conn_arc = {
+        let conn = {
             let connections = self.connections.read().await;
             connections.get(&dest).cloned()
         };
 
-        if let Some(conn_arc) = conn_arc {
-            let mut conn = conn_arc.lock().await;
+        if let Some(conn) = conn {
+            let mut w = conn.write_half.lock().await;
             trace!("Sending {} bytes to {} over TCP", msg.data.len(), dest);
-            conn.write_message(&msg.data).await?;
+            stream_write_all_half(&mut w, &msg.data).await?;
             Ok(())
         } else {
             Err(crate::core::TransportError::ConnectionClosed.into())
@@ -917,10 +1225,15 @@ mod tests {
         });
 
         let (stream, remote_addr) = listener.accept().await.unwrap();
+        let local_addr = stream.local_addr().unwrap();
+        let (_read_half, write_half) = stream.into_split();
         let mut map = HashMap::new();
         map.insert(
             remote_addr,
-            Arc::new(Mutex::new(TcpConnection::new(stream, remote_addr))),
+            Arc::new(ConnectionHandle {
+                write_half: Mutex::new(write_half),
+                local_addr,
+            }),
         );
         let sender = TcpSender {
             connections: Arc::new(RwLock::new(map)),
@@ -2072,5 +2385,156 @@ mod tests {
         // Two pongs may arrive coalesced as `\r\n\r\n` or split.
         assert!(n >= 2, "expected at least one CRLF pong, got {} bytes", n);
         assert!(&buf[..n].starts_with(b"\r\n"));
+    }
+
+    // --- Regression test for the 2026-07-09 read/write lock-separation fix ---
+
+    /// Reproduces the original bug directly: send a message on a
+    /// connection, receive its response, then send a *second* message
+    /// on the *same* connection while the read loop is idling between
+    /// messages. Before the fix, this hung indefinitely — the read
+    /// loop held the connection's only lock for the entire blocking
+    /// read, starving the second `send()`. Bounded by a timeout so a
+    /// regression fails the test instead of hanging CI.
+    #[tokio::test]
+    async fn test_tcp_send_after_idle_read_does_not_deadlock() {
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let server = TcpTransport::bind(server_addr).await.unwrap();
+        let server_addr = server.local_addr();
+        let (mut server_rx, server_sender) = server.start();
+
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let client = TcpTransport::new_client(client_addr);
+        client.connect(server_addr).await.unwrap();
+        let (mut client_rx, client_sender) = client.start();
+
+        let round_trip = async {
+            // First message: client -> server -> (small delay to let
+            // the read loop go back to idling) -> server -> client.
+            client_sender
+                .send_to(
+                    b"INVITE sip:one@example.com SIP/2.0\r\nContent-Length: 0\r\n\r\n",
+                    server_addr,
+                )
+                .await
+                .unwrap();
+            let received = server_rx.recv().await.unwrap();
+            let reply_dest = received.source;
+
+            // Give the client's read loop time to go back to idling on
+            // its blocking read -- this is the window in which the old
+            // code held the lock indefinitely.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            server_sender
+                .send_to(
+                    b"SIP/2.0 100 Trying\r\nContent-Length: 0\r\n\r\n",
+                    reply_dest,
+                )
+                .await
+                .unwrap();
+            let _ = client_rx.recv().await.unwrap();
+
+            // Second message on the SAME connection -- this is exactly
+            // what deadlocked before the fix.
+            client_sender
+                .send_to(
+                    b"INVITE sip:two@example.com SIP/2.0\r\nContent-Length: 0\r\n\r\n",
+                    server_addr,
+                )
+                .await
+                .unwrap();
+            let second = server_rx.recv().await.unwrap();
+            assert!(second.data.starts_with(b"INVITE sip:two"));
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), round_trip)
+            .await
+            .expect("second send on a reused TCP connection deadlocked");
+    }
+
+    #[tokio::test]
+    async fn test_tcp_connection_local_addr() {
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let server = TcpTransport::bind(server_addr).await.unwrap();
+        let server_addr = server.local_addr();
+
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let client = TcpTransport::new_client(client_addr);
+        client.connect(server_addr).await.unwrap();
+
+        // The transport's nominal local_addr is just whatever was
+        // passed to new_client (port 0 here) -- connection_local_addr
+        // should report the real OS-assigned port instead.
+        assert_eq!(client.local_addr().port(), 0);
+        let real_local = client.connection_local_addr(server_addr).await.unwrap();
+        assert_ne!(real_local.port(), 0);
+        assert_eq!(real_local.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[tokio::test]
+    async fn test_tcp_connection_local_addr_unknown_remote() {
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let client = TcpTransport::new_client(client_addr);
+        let unknown = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
+        assert!(client.connection_local_addr(unknown).await.is_none());
+    }
+
+    /// `connect()` should bind the outbound connection to a *specific*
+    /// requested local port when `new_client` was given a nonzero
+    /// port, not just report back whatever the OS happened to assign
+    /// (that's `test_tcp_connection_local_addr` above, with `:0`).
+    #[tokio::test]
+    async fn test_tcp_connect_binds_specific_local_port() {
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let server = TcpTransport::bind(server_addr).await.unwrap();
+        let server_addr = server.local_addr();
+        let (mut server_rx, _server_sender) = server.start();
+
+        // Reserve a free ephemeral port the same way a real caller
+        // would (bind to :0, read it back, drop the probe socket),
+        // then ask `new_client` to use that specific port.
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let requested_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), requested_port);
+        let client = TcpTransport::new_client(client_addr);
+        client.connect(server_addr).await.unwrap();
+
+        let real_local = client.connection_local_addr(server_addr).await.unwrap();
+        assert_eq!(real_local.port(), requested_port);
+
+        // Sanity: the connection actually works end-to-end from that
+        // specific port, not just that the bind succeeded.
+        client
+            .send_to(
+                b"INVITE sip:test@example.com SIP/2.0\r\nContent-Length: 0\r\n\r\n",
+                server_addr,
+            )
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), server_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(received.data.starts_with(b"INVITE"));
+        assert_eq!(received.source.port(), requested_port);
+    }
+
+    /// A `:0` port on `new_client` must keep the original OS-assigned
+    /// behavior (no regression from the new specific-port bind path).
+    #[tokio::test]
+    async fn test_tcp_connect_with_zero_port_uses_os_assigned_port() {
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let server = TcpTransport::bind(server_addr).await.unwrap();
+        let server_addr = server.local_addr();
+
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let client = TcpTransport::new_client(client_addr);
+        client.connect(server_addr).await.unwrap();
+
+        let real_local = client.connection_local_addr(server_addr).await.unwrap();
+        assert_ne!(real_local.port(), 0);
     }
 }

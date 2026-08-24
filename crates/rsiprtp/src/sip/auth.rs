@@ -3,8 +3,13 @@
 //! Provides parsing of WWW-Authenticate/Proxy-Authenticate headers
 //! and generation of Authorization/Proxy-Authorization headers.
 //!
-//! Supports MD5 (legacy) and SHA-256 (RFC 7616) algorithms.
+//! Supports MD5 (legacy), SHA-256 (RFC 7616), and IMS AKAv1-MD5 (RFC
+//! 3310) / AKAv2-MD5 (RFC 4169) algorithms.
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
+use hmac::{Hmac, Mac};
+use md5_rc::Md5;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -64,6 +69,27 @@ pub enum Algorithm {
     Sha256,
     /// SHA-256-sess algorithm (RFC 7616).
     Sha256Sess,
+    /// AKA version 1 with MD5 (RFC 3310) — used for IMS AKA
+    /// authentication (3GPP TS 33.203). Wire-format digest math is
+    /// identical to `Md5`; the network's challenge carries
+    /// `algorithm=AKAv1-MD5`, and per RFC 3310 §3.3 the "password" slot
+    /// in the HA1 computation is filled with the AKA-derived RES,
+    /// hex-encoded, rather than a real password. Callers compute RES
+    /// via Milenage (or a physical USIM) and pass `hex::encode(res)` as
+    /// `DigestCredentials::password` — no other change to the digest
+    /// math is needed.
+    AkaV1Md5,
+    /// AKA version 2 with MD5 (RFC 4169) — the follow-up to AKAv1
+    /// designed to resist a man-in-the-middle attack against tunneled
+    /// authentication (RFC 4169 §4.3). Some IMS cores require AKAv2
+    /// over AKAv1. Wire-format digest math is *also* identical to
+    /// `Md5`; the difference is entirely in how the "password" is
+    /// derived before it reaches HA1: RFC 4169 §2.1 defines it as
+    /// `base64(HMAC_MD5(RES‖IK‖CK, "http-digest-akav2-password"))`
+    /// rather than plain `hex(RES)`. Use [`derive_akav2_password`] to
+    /// compute that value, then pass it as
+    /// `DigestCredentials::password` exactly as with `AkaV1Md5`.
+    AkaV2Md5,
 }
 
 impl fmt::Display for Algorithm {
@@ -73,8 +99,43 @@ impl fmt::Display for Algorithm {
             Algorithm::Md5Sess => write!(f, "MD5-sess"),
             Algorithm::Sha256 => write!(f, "SHA-256"),
             Algorithm::Sha256Sess => write!(f, "SHA-256-sess"),
+            Algorithm::AkaV1Md5 => write!(f, "AKAv1-MD5"),
+            Algorithm::AkaV2Md5 => write!(f, "AKAv2-MD5"),
         }
     }
+}
+
+/// Derive the AKAv2-MD5 HTTP Digest "password" per RFC 4169 §2.1:
+///
+/// ```text
+/// base64(HMAC_MD5(key = RES || IK || CK, data = "http-digest-akav2-password"))
+/// ```
+///
+/// The caller passes the returned string as `DigestCredentials::password`
+/// together with `Algorithm::AkaV2Md5` — the digest math itself (HA1/
+/// HA2/response) is identical to `Md5`; only this password-derivation
+/// step differs from AKAv1. The server performs the same computation
+/// with XRES in place of RES (equal to RES on a successful
+/// authentication).
+///
+/// Does not derive the optional masked session keys IK'/CK' from RFC
+/// 4169 §2.2 — those protect session material reused *outside* HTTP
+/// Digest and aren't needed for AKAv2-MD5 authentication itself. Add
+/// them here (same HMAC-MD5 construction, different label strings) if
+/// a future stage needs them.
+pub fn derive_akav2_password(res: &[u8], ik: &[u8], ck: &[u8]) -> String {
+    type HmacMd5 = Hmac<Md5>;
+
+    let mut key = Vec::with_capacity(res.len() + ik.len() + ck.len());
+    key.extend_from_slice(res);
+    key.extend_from_slice(ik);
+    key.extend_from_slice(ck);
+
+    let mut mac = HmacMd5::new_from_slice(&key).expect("HMAC can take a key of any size");
+    mac.update(b"http-digest-akav2-password");
+    let result = mac.finalize().into_bytes();
+
+    BASE64_STANDARD.encode(result)
 }
 
 /// Parsed WWW-Authenticate or Proxy-Authenticate challenge.
@@ -135,6 +196,8 @@ impl DigestChallenge {
             Some("MD5-sess") => Algorithm::Md5Sess,
             Some("SHA-256") => Algorithm::Sha256,
             Some("SHA-256-sess") => Algorithm::Sha256Sess,
+            Some("AKAv1-MD5") => Algorithm::AkaV1Md5,
+            Some("AKAv2-MD5") => Algorithm::AkaV2Md5,
             Some(other) => return Err(DigestAuthError::UnsupportedAlgorithm(other.to_string())),
         };
 
@@ -338,7 +401,9 @@ fn compute_digest(
 ) -> String {
     // Select hash function based on algorithm
     let (hash_str, hash_bytes): (HashStrFn, HashBytesFn) = match algorithm {
-        Algorithm::Md5 | Algorithm::Md5Sess => (hash_md5, hash_md5_bytes),
+        Algorithm::Md5 | Algorithm::Md5Sess | Algorithm::AkaV1Md5 | Algorithm::AkaV2Md5 => {
+            (hash_md5, hash_md5_bytes)
+        }
         Algorithm::Sha256 | Algorithm::Sha256Sess => (hash_sha256, hash_sha256_bytes),
     };
 
@@ -347,7 +412,9 @@ fn compute_digest(
         let ha1_base = hash_str(&format!("{}:{}:{}", username, realm, password));
 
         match algorithm {
-            Algorithm::Md5 | Algorithm::Sha256 => ha1_base,
+            Algorithm::Md5 | Algorithm::Sha256 | Algorithm::AkaV1Md5 | Algorithm::AkaV2Md5 => {
+                ha1_base
+            }
             Algorithm::Md5Sess | Algorithm::Sha256Sess => {
                 // HA1 = H(H(username:realm:password):nonce:cnonce)
                 let cnonce = cnonce.unwrap_or("");
@@ -641,6 +708,226 @@ mod tests {
         assert_eq!(format!("{}", Algorithm::Md5Sess), "MD5-sess");
         assert_eq!(format!("{}", Algorithm::Sha256), "SHA-256");
         assert_eq!(format!("{}", Algorithm::Sha256Sess), "SHA-256-sess");
+        assert_eq!(format!("{}", Algorithm::AkaV1Md5), "AKAv1-MD5");
+        assert_eq!(format!("{}", Algorithm::AkaV2Md5), "AKAv2-MD5");
+    }
+
+    #[test]
+    fn test_parse_akav1_md5_algorithm() {
+        let challenge = DigestChallenge::parse(
+            r#"Digest realm="ims.example.com", nonce="abc", algorithm=AKAv1-MD5"#,
+        )
+        .unwrap();
+        assert_eq!(challenge.algorithm, Algorithm::AkaV1Md5);
+    }
+
+    #[test]
+    fn test_parse_akav2_md5_algorithm() {
+        let challenge = DigestChallenge::parse(
+            r#"Digest realm="ims.example.com", nonce="abc", algorithm=AKAv2-MD5"#,
+        )
+        .unwrap();
+        assert_eq!(challenge.algorithm, Algorithm::AkaV2Md5);
+    }
+
+    /// Independent check that the `Hmac<Md5>` wiring itself is correct,
+    /// decoupled from RFC 4169 specifics: the canonical RFC 2104/2202
+    /// HMAC-MD5 test vector (key = "Jefe", data = "what do ya want for
+    /// nothing?" -> 750c783e6ab0b503eaa86e310a5db738).
+    #[test]
+    fn test_hmac_md5_primitive_rfc2202_vector() {
+        type HmacMd5 = Hmac<Md5>;
+        let mut mac = HmacMd5::new_from_slice(b"Jefe").unwrap();
+        mac.update(b"what do ya want for nothing?");
+        let result = mac.finalize().into_bytes();
+        assert_eq!(hex::encode(result), "750c783e6ab0b503eaa86e310a5db738");
+    }
+
+    #[test]
+    fn test_derive_akav2_password_is_deterministic() {
+        let res = b"\xa5\x42\x11\xd5\xe3\xba\x50\xbf";
+        let ik = b"\xf7\x69\xbc\xd7\x51\x04\x46\x04\x12\x76\x72\x71\x1c\x6d\x34\x41";
+        let ck = b"\xb4\x0b\xa9\xa3\xc5\x8b\x2a\x05\xbb\xf0\xd9\x87\xb2\x1b\xf8\xcb";
+
+        let p1 = derive_akav2_password(res, ik, ck);
+        let p2 = derive_akav2_password(res, ik, ck);
+        assert_eq!(p1, p2);
+        // base64 of a 16-byte MD5 digest is 24 chars with one '=' pad.
+        assert_eq!(p1.len(), 24);
+        assert!(p1.ends_with('='));
+    }
+
+    #[test]
+    fn test_derive_akav2_password_differs_from_akav1_password() {
+        // AKAv1's "password" is just hex(RES); AKAv2's must not collapse
+        // to the same value even though RES is part of its input.
+        let res = b"\xa5\x42\x11\xd5\xe3\xba\x50\xbf";
+        let ik = b"\xf7\x69\xbc\xd7\x51\x04\x46\x04\x12\x76\x72\x71\x1c\x6d\x34\x41";
+        let ck = b"\xb4\x0b\xa9\xa3\xc5\x8b\x2a\x05\xbb\xf0\xd9\x87\xb2\x1b\xf8\xcb";
+
+        let akav1_password = hex::encode(res);
+        let akav2_password = derive_akav2_password(res, ik, ck);
+        assert_ne!(akav1_password, akav2_password);
+    }
+
+    #[test]
+    fn test_derive_akav2_password_sensitive_to_each_input() {
+        let res = b"\xa5\x42\x11\xd5\xe3\xba\x50\xbf";
+        let ik = b"\xf7\x69\xbc\xd7\x51\x04\x46\x04\x12\x76\x72\x71\x1c\x6d\x34\x41";
+        let ck = b"\xb4\x0b\xa9\xa3\xc5\x8b\x2a\x05\xbb\xf0\xd9\x87\xb2\x1b\xf8\xcb";
+        let other_ck = b"\x00\x0b\xa9\xa3\xc5\x8b\x2a\x05\xbb\xf0\xd9\x87\xb2\x1b\xf8\xcb";
+
+        let p_ck = derive_akav2_password(res, ik, ck);
+        let p_other_ck = derive_akav2_password(res, ik, other_ck);
+        assert_ne!(p_ck, p_other_ck);
+    }
+
+    #[test]
+    fn test_compute_digest_akav2_md5_matches_plain_md5_given_same_password() {
+        // AKAv2's *outer* digest math (HA1/HA2/response) is identical to
+        // Md5 — same assertion style as the AKAv1 equivalence test, just
+        // using an AKAv2-derived password string as the input.
+        let res = b"\xa5\x42\x11\xd5\xe3\xba\x50\xbf";
+        let ik = b"\xf7\x69\xbc\xd7\x51\x04\x46\x04\x12\x76\x72\x71\x1c\x6d\x34\x41";
+        let ck = b"\xb4\x0b\xa9\xa3\xc5\x8b\x2a\x05\xbb\xf0\xd9\x87\xb2\x1b\xf8\xcb";
+        let akav2_password = derive_akav2_password(res, ik, ck);
+
+        let aka_response = compute_digest(
+            "001010000000001@ims.mnc001.mcc001.3gppnetwork.org",
+            &akav2_password,
+            "ims.mnc001.mcc001.3gppnetwork.org",
+            "REGISTER",
+            "sip:ims.mnc001.mcc001.3gppnetwork.org",
+            "servernonce",
+            Algorithm::AkaV2Md5,
+            None,
+            None,
+            None,
+            None,
+        );
+        let plain_md5_response = compute_digest(
+            "001010000000001@ims.mnc001.mcc001.3gppnetwork.org",
+            &akav2_password,
+            "ims.mnc001.mcc001.3gppnetwork.org",
+            "REGISTER",
+            "sip:ims.mnc001.mcc001.3gppnetwork.org",
+            "servernonce",
+            Algorithm::Md5,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(aka_response, plain_md5_response);
+        assert_eq!(aka_response.len(), 32);
+    }
+
+    #[test]
+    fn test_digest_response_with_akav2_md5_header() {
+        let res = b"\xa5\x42\x11\xd5\xe3\xba\x50\xbf";
+        let ik = b"\xf7\x69\xbc\xd7\x51\x04\x46\x04\x12\x76\x72\x71\x1c\x6d\x34\x41";
+        let ck = b"\xb4\x0b\xa9\xa3\xc5\x8b\x2a\x05\xbb\xf0\xd9\x87\xb2\x1b\xf8\xcb";
+        let akav2_password = derive_akav2_password(res, ik, ck);
+
+        let challenge = DigestChallenge {
+            realm: "ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            nonce: "abc123".to_string(),
+            opaque: None,
+            stale: false,
+            algorithm: Algorithm::AkaV2Md5,
+            qop: None,
+            domain: None,
+        };
+
+        let creds = DigestCredentials::new(
+            "001010000000001@ims.mnc001.mcc001.3gppnetwork.org",
+            akav2_password,
+        );
+        let response = DigestResponse::from_challenge(
+            &challenge,
+            &creds,
+            "REGISTER",
+            "sip:ims.mnc001.mcc001.3gppnetwork.org",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(response.algorithm, Algorithm::AkaV2Md5);
+        let header = response.to_header_value();
+        assert!(header.contains("algorithm=AKAv2-MD5"));
+    }
+
+    /// RFC 3310 §3.3: AKAv1-MD5 uses the exact same digest math as plain
+    /// MD5 — the network's AKA-derived RES (hex-encoded) is used in the
+    /// "password" slot of HA1 rather than a real password. This test
+    /// asserts that equivalence directly: `AkaV1Md5` and `Md5` must
+    /// produce identical digests for identical inputs.
+    #[test]
+    fn test_compute_digest_akav1_md5_matches_plain_md5() {
+        let res_hex = "a54211d5e3ba50bf"; // TS 35.208 Test Set 1 RES, used as the AKA "password"
+
+        let aka_response = compute_digest(
+            "001010000000001@ims.mnc001.mcc001.3gppnetwork.org",
+            res_hex,
+            "ims.mnc001.mcc001.3gppnetwork.org",
+            "REGISTER",
+            "sip:ims.mnc001.mcc001.3gppnetwork.org",
+            "servernonce",
+            Algorithm::AkaV1Md5,
+            None,
+            None,
+            None,
+            None,
+        );
+        let plain_md5_response = compute_digest(
+            "001010000000001@ims.mnc001.mcc001.3gppnetwork.org",
+            res_hex,
+            "ims.mnc001.mcc001.3gppnetwork.org",
+            "REGISTER",
+            "sip:ims.mnc001.mcc001.3gppnetwork.org",
+            "servernonce",
+            Algorithm::Md5,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(aka_response, plain_md5_response);
+        assert_eq!(aka_response.len(), 32);
+    }
+
+    #[test]
+    fn test_digest_response_with_akav1_md5_header() {
+        let challenge = DigestChallenge {
+            realm: "ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            nonce: "abc123".to_string(),
+            opaque: None,
+            stale: false,
+            algorithm: Algorithm::AkaV1Md5,
+            qop: None,
+            domain: None,
+        };
+
+        let creds = DigestCredentials::new(
+            "001010000000001@ims.mnc001.mcc001.3gppnetwork.org",
+            "a54211d5e3ba50bf",
+        );
+        let response = DigestResponse::from_challenge(
+            &challenge,
+            &creds,
+            "REGISTER",
+            "sip:ims.mnc001.mcc001.3gppnetwork.org",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(response.algorithm, Algorithm::AkaV1Md5);
+        let header = response.to_header_value();
+        assert!(header.contains("algorithm=AKAv1-MD5"));
     }
 
     #[test]

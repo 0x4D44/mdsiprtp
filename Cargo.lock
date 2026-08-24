@@ -1265,6 +1265,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "md5"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1867,7 +1877,7 @@ checksum = "b1690d2cc1b13c9ff67f48f59bd2b0bb9bb57e157b5cce2d0b27ccf8e11964c3"
 dependencies = [
  "bstr",
  "bytes",
- "md-5",
+ "md-5 0.9.1",
  "nom",
  "rsip-derives",
  "sha2 0.9.9",
@@ -1900,6 +1910,7 @@ dependencies = [
  "hex",
  "hickory-resolver",
  "hmac",
+ "md-5 0.10.6",
  "md5",
  "p256",
  "proptest",

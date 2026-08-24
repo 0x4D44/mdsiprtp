@@ -642,6 +642,17 @@ impl SipResponse {
         None
     }
 
+    /// Get the `Security-Server` header value (3GPP TS 33.203 §7.1,
+    /// via RFC 3329's `Security-Server` header) if present.
+    ///
+    /// Not part of RFC 3261's typed header model — carried as
+    /// `Header::Other`, matched case-insensitively. Used to read the
+    /// P-CSCF's IPsec algorithm/SPI/port proposal out of the 401
+    /// response during IMS AKA registration.
+    pub fn security_server(&self) -> Option<String> {
+        find_other_header(&self.inner.headers, "Security-Server")
+    }
+
     /// Get the `Require` header (RFC 3261 §20.32) if present.
     pub fn require(&self) -> Option<crate::sip::headers::Require> {
         find_require(&self.inner.headers)
@@ -3092,6 +3103,35 @@ Content-Length: 0\r\n\
         let auth_str = auth.unwrap();
         assert!(auth_str.contains("Digest"));
         assert!(auth_str.contains("example.com"));
+    }
+
+    #[test]
+    fn test_parse_response_with_security_server() {
+        let resp_with_security = b"SIP/2.0 401 Unauthorized\r\n\
+Via: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bK776asdhds\r\n\
+To: Bob <sip:bob@biloxi.com>;tag=a6c85cf\r\n\
+From: Alice <sip:alice@atlanta.com>;tag=1928301774\r\n\
+Call-ID: a84b4c76e66710@pc33.atlanta.com\r\n\
+CSeq: 314159 REGISTER\r\n\
+WWW-Authenticate: Digest realm=\"ims.example.com\", nonce=\"abc123\", algorithm=AKAv1-MD5\r\n\
+Security-Server: ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;spi-c=1111;spi-s=2222;port-c=3333;port-s=4444\r\n\
+Content-Length: 0\r\n\
+\r\n";
+        let msg = SipMessage::parse(resp_with_security).unwrap();
+        let resp = msg.as_response().unwrap();
+        let security_server = resp.security_server();
+        assert!(security_server.is_some());
+        let value = security_server.unwrap();
+        assert!(value.contains("ipsec-3gpp"));
+        assert!(value.contains("spi-c=1111"));
+        assert!(value.contains("spi-s=2222"));
+    }
+
+    #[test]
+    fn test_response_security_server_none() {
+        let msg = SipMessage::parse(RESPONSE_MSG).unwrap();
+        let resp = msg.as_response().unwrap();
+        assert!(resp.security_server().is_none());
     }
 
     #[test]

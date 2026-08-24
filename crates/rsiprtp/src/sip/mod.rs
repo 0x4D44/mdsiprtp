@@ -26,7 +26,8 @@ pub use message::{
 
 // Re-export auth types
 pub use auth::{
-    Algorithm, DigestAuthError, DigestChallenge, DigestCredentials, DigestResponse, Qop,
+    derive_akav2_password, Algorithm, DigestAuthError, DigestChallenge, DigestCredentials,
+    DigestResponse, Qop,
 };
 
 // Re-export header types

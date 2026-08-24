@@ -55,16 +55,46 @@ impl Via {
             (rest, None)
         };
 
-        // Parse host and port
-        let (host, port) = if let Some(idx) = host_port.rfind(':') {
+        // Parse host and port.
+        // IPv6 references are bracketed per RFC 3261 §25.1:
+        //   `sent-by = host [ COLON port ]`
+        //   `host    = hostname / IPv4address / IPv6reference`
+        //   `IPv6reference = "[" IPv6address "]"`
+        // For `[2001:db8::1]:5060`, the port separator is the colon
+        // AFTER the closing bracket, not the last colon in the string.
+        let host_port = host_port.trim();
+        let (host, port) = if host_port.starts_with('[') {
+            // IPv6 reference — find the closing bracket.
+            if let Some(close) = host_port.find(']') {
+                let host = host_port[..=close].to_string();
+                let after = &host_port[close + 1..];
+                if after.is_empty() {
+                    // No port: `[::1]`
+                    (host, 5060)
+                } else if let Some(port_str) = after.strip_prefix(':') {
+                    // Has port: `[::1]:5060`
+                    (host, port_str.parse().unwrap_or(5060))
+                } else {
+                    // Malformed (garbage after `]` without `:`)
+                    return Err(SipError::Parse(format!(
+                        "Via IPv6 sent-by has trailing data after ']': {host_port}"
+                    )));
+                }
+            } else {
+                return Err(SipError::Parse(format!(
+                    "Via IPv6 sent-by missing closing ']': {host_port}"
+                )));
+            }
+        } else if let Some(idx) = host_port.rfind(':') {
             let port_str = &host_port[idx + 1..];
-            // Check if it's actually a port (all digits) or part of IPv6
-            if port_str.chars().all(|c| c.is_ascii_digit()) && !host_port.contains('[') {
+            if port_str.chars().all(|c| c.is_ascii_digit()) && !port_str.is_empty() {
                 (
                     host_port[..idx].to_string(),
                     port_str.parse().unwrap_or(5060),
                 )
             } else {
+                // Bare IPv6 without brackets (non-conformant but
+                // tolerate gracefully) or non-numeric after last colon.
                 (host_port.to_string(), 5060)
             }
         } else {
@@ -779,8 +809,58 @@ mod tests {
     #[test]
     fn test_via_parse_ipv6_with_port() {
         let via = Via::parse("SIP/2.0/UDP [2001:db8::1]:5060;branch=z9hG4bK123").unwrap();
-        assert_eq!(via.host, "[2001:db8::1]:5060");
+        assert_eq!(via.host, "[2001:db8::1]");
         assert_eq!(via.port, 5060);
+    }
+
+    #[test]
+    fn test_via_parse_ipv6_no_port() {
+        let via = Via::parse("SIP/2.0/TCP [::1];branch=z9hG4bK456").unwrap();
+        assert_eq!(via.host, "[::1]");
+        assert_eq!(via.port, 5060);
+    }
+
+    #[test]
+    fn test_via_parse_ipv6_non_standard_port() {
+        let via =
+            Via::parse("SIP/2.0/TLS [fe80::1%25eth0]:5061;branch=z9hG4bK789").unwrap();
+        assert_eq!(via.host, "[fe80::1%25eth0]");
+        assert_eq!(via.port, 5061);
+    }
+
+    #[test]
+    fn test_via_parse_ipv6_full_address() {
+        let via = Via::parse(
+            "SIP/2.0/UDP [2001:0db8:85a3:0000:0000:8a2e:0370:7334]:4060;branch=z9hG4bKfull",
+        )
+        .unwrap();
+        assert_eq!(via.host, "[2001:0db8:85a3:0000:0000:8a2e:0370:7334]");
+        assert_eq!(via.port, 4060);
+    }
+
+    #[test]
+    fn test_via_ipv6_round_trip() {
+        // Parse → serialize → parse must be stable.
+        let input = "SIP/2.0/UDP [2001:db8::1]:5060;branch=z9hG4bKrt";
+        let via = Via::parse(input).unwrap();
+        let serialized = via.to_header_value();
+        assert_eq!(serialized, input);
+        let via2 = Via::parse(&serialized).unwrap();
+        assert_eq!(via2.host, "[2001:db8::1]");
+        assert_eq!(via2.port, 5060);
+    }
+
+    #[test]
+    fn test_via_ipv6_loopback_round_trip() {
+        let input = "SIP/2.0/TCP [::1]:5060;branch=z9hG4bKlo";
+        let via = Via::parse(input).unwrap();
+        assert_eq!(via.to_header_value(), input);
+    }
+
+    #[test]
+    fn test_via_parse_ipv6_unterminated_bracket() {
+        let result = Via::parse("SIP/2.0/UDP [2001:db8::1:5060;branch=z9hG4bK1");
+        assert!(result.is_err());
     }
 
     #[test]
